@@ -18,6 +18,7 @@
 #include "qemu/log.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/main-loop.h"
 #include "qapi/error.h"
 #include "hw/sysbus.h"
 #include "migration/vmstate.h"
@@ -25,6 +26,9 @@
 #include "hw/gpio/bcm2835_gpio.h"
 #include "hw/intc/bcm2835_ic.h"
 #include "hw/irq.h"
+#include "time.h"
+#include "fcntl.h"
+#include "sys/stat.h"
 
 #define GPFSEL0   0x00
 #define GPFSEL1   0x04
@@ -55,6 +59,14 @@
 #define GPPUD     0x94
 #define GPPUDCLK0 0x98
 #define GPPUDCLK1 0x9C
+
+typedef struct {
+    uint16_t magic;
+    uint8_t pin;
+    uint8_t state;
+} gpio_msg;
+
+#define GPIO_MSG_MAGIC ((uint16_t)0x2345)
 
 static uint32_t gpfsel_get(BCM2835GpioState *s, uint8_t reg)
 {
@@ -137,6 +149,124 @@ static int fen_detect(BCM2835GpioState *s, int index)
     return 0;
 }
 
+static int gpio_get_level(BCM2835GpioState *s, int index)
+{
+    if (index >= 0 && index < 54)
+    {
+        return get_bit_2_u32(index, s->lev0, s->lev1);
+    }
+    return 0;
+}
+
+static void send_gpio_state_mq(BCM2835GpioState *s)
+{
+    gpio_msg msg;
+    int i;
+
+    msg.magic = GPIO_MSG_MAGIC;
+    for (i = 0; i < 54; i++)
+    {
+        msg.pin = i;
+        msg.state = gpio_get_level(s, i) << 4 | s->fsel[i];
+        if (-1 == mq_send(s->mq_send, (char *)&msg, sizeof(msg), 0))
+            if (errno != EAGAIN)
+                perror("failed to send gpio state");
+    }
+}
+
+static void set_gpio_state(BCM2835GpioState *s, int index, int val)
+{
+    int original_value;
+
+    if (index < 0 || index >= 54)
+        return;
+
+    if(s->fsel[index] != 0)
+        return;
+
+    original_value = gpio_get_level(s, index);
+
+    val =  !!val;
+
+    if(index < 32)
+        s->lev0 = (s->lev0 & ~(1 << index)) | (val << index);
+    else
+        s->lev1 = (s->lev1 & ~(1 << (index - 32))) | (val << (index - 32));
+
+    qemu_mutex_lock(&s->data_lock);
+
+    if (original_value == 0 && val == 1 && ren_detect(s, index))
+    {
+        if (index < 32)
+            s->eds0 |= (1 << index);
+        else
+            s->eds1 |= (1 << (index - 32));
+        qemu_set_irq(s->irq[index <= 27 ? 0 : index <= 45 ? 1
+                                                          : 2],
+                     1);
+    }
+
+    if (original_value == 1 && val == 0 && fen_detect(s, index))
+    {
+        if (index < 32)
+            s->eds0 |= (1 << index);
+        else
+            s->eds1 |= (1 << (index - 32));
+        qemu_set_irq(s->irq[index <= 27 ? 0 : index <= 45 ? 1
+                                                          : 2],
+                     1);
+    }
+
+    qemu_mutex_unlock(&s->data_lock);
+}
+
+static void *bcm2835_gpio_thread(void *arg)
+{
+    BCM2835GpioState *s = (BCM2835GpioState *)arg;
+    struct
+    {
+        gpio_msg msg;
+        char buf[126];
+    } msg_buf;
+    int ret;
+    struct timespec timeout;
+
+    timeout.tv_sec = 1;
+    timeout.tv_nsec = 0;
+
+    while (1)
+    {
+        ret = mq_timedreceive(s->mq_recv, (char *)&msg_buf, sizeof(msg_buf), 0, &timeout);
+        if (ret == -1)
+        {
+            if (errno == ETIMEDOUT)
+            {
+                continue;
+            }
+            perror("failed to receive gpio state");
+            continue;
+        }
+        if (msg_buf.msg.magic != GPIO_MSG_MAGIC)
+        {
+            fprintf(stderr, "invalid gpio message magic\n");
+            continue;
+        }
+        if( msg_buf.msg.pin == 127 )
+        {
+            send_gpio_state_mq(s);
+        }
+        if (msg_buf.msg.pin >= 54)
+        {
+            fprintf(stderr, "invalid gpio pin\n");
+            continue;
+        }
+        qemu_mutex_lock_iothread();
+        set_gpio_state(s, msg_buf.msg.pin, msg_buf.msg.state);
+        qemu_mutex_unlock_iothread();
+    }
+    return NULL;
+}
+
 static void gpset(BCM2835GpioState *s,
         uint32_t val, uint8_t start, uint8_t count, uint32_t *lev)
 {
@@ -147,25 +277,11 @@ static void gpset(BCM2835GpioState *s,
     for (i = 0; i < count; i++) {
         if ((changes & cur) && (gpfsel_is_out(s, start + i))) {
             qemu_set_irq(s->out[start + i], 1);
-        } else if ((changes & cur) && ren_detect(s, start + i)) {
-            /* If this is an input and must check rising edge */
-            int irqline = 0;
-            if (i > 27)
-                irqline = 1;
-            if (i > 45)
-                irqline = 2;
-
-            /* Set the bit in the events */
-            if (i < 32)
-                s->eds0 |= cur;
-            else
-                s->eds1 |= cur;
-            qemu_set_irq(s->irq[irqline], 1);
         }
+        if(s->fsel[start + i] != 0)
+            *lev = *lev | (val & cur);
         cur <<= 1;
     }
-
-    *lev |= val;
 }
 
 static void gpclr(BCM2835GpioState *s,
@@ -178,20 +294,11 @@ static void gpclr(BCM2835GpioState *s,
     for (i = 0; i < count; i++) {
         if ((changes & cur) && (gpfsel_is_out(s, start + i))) {
             qemu_set_irq(s->out[start + i], 0);
-        } else if ((changes & cur) && fen_detect(s, start + i)) {
-            /* If this is an input we must check falling edge */
-            int irqline = 0;
-            if (i > 27)
-                irqline = 1;
-            if (i > 45)
-              irqline = 2;
-
-            qemu_set_irq(s->irq[irqline], 1);
+            if(s->fsel[start + i] != 0)
+                *lev = *lev & ~(val & cur);
         }
         cur <<= 1;
     }
-
-    *lev &= ~val;
 }
 
 static int gpio_from_value(uint64_t value, int bank)
@@ -206,20 +313,24 @@ static int gpio_from_value(uint64_t value, int bank)
 static void eds_clear(BCM2835GpioState *s, uint64_t value, int bank)
 {
     int gpio = 0;
-    int irqline = 0;
-    if (bank) {
+
+    qemu_mutex_lock(&s->data_lock);
+
+    if (bank)
         s->eds0 &= ~value;
-    } else {
+    else
         s->eds1 &= (~value & 0x3f);
-    }
+
     gpio = gpio_from_value(value, bank);
 
-    if (gpio > 27)
-       irqline = 1;
-    if (gpio > 45)
-       irqline = 2;
+    if (gpio <= 27)
+        qemu_set_irq(s->irq[0], !!(s->eds0 & 0x7ffffff));
+    else if (gpio <= 45)
+        qemu_set_irq(s->irq[1], (s->eds0 & 0xf8000000) || (s->eds1 & 0x1fff));
+    else
+        qemu_set_irq(s->irq[2], !!(s->eds1 & 0x3fe000));
 
-    qemu_set_irq(s->irq[irqline], 0);
+    qemu_mutex_unlock(&s->data_lock);
 }
 
 static uint64_t bcm2835_gpio_read(void *opaque, hwaddr offset,
@@ -297,15 +408,19 @@ static void bcm2835_gpio_write(void *opaque, hwaddr offset,
         break;
     case GPSET0:
         gpset(s, value, 0, 32, &s->lev0);
+        send_gpio_state_mq(s);
         break;
     case GPSET1:
         gpset(s, value, 32, 22, &s->lev1);
+        send_gpio_state_mq(s);
         break;
     case GPCLR0:
         gpclr(s, value, 0, 32, &s->lev0);
+        send_gpio_state_mq(s);
         break;
     case GPCLR1:
         gpclr(s, value, 32, 22, &s->lev1);
+        send_gpio_state_mq(s);
         break;
     case GPLEV0:
     case GPLEV1:
@@ -395,12 +510,41 @@ static void bcm2835_gpio_init(Object *obj)
     DeviceState *dev = DEVICE(obj);
     SysBusDevice *sbd = SYS_BUS_DEVICE(obj);
 
+    struct mq_attr mqattr;
+
     qbus_init(&s->sdbus, sizeof(s->sdbus), TYPE_SD_BUS, DEVICE(s), "sd-bus");
 
     memory_region_init_io(&s->iomem, obj,
             &bcm2835_gpio_ops, s, "bcm2835_gpio", 0x1000);
     sysbus_init_mmio(sbd, &s->iomem);
     qdev_init_gpio_out(dev, s->out, 54);
+
+    qemu_mutex_init(&s->data_lock);
+
+    mqattr.mq_flags = 0;
+    mqattr.mq_curmsgs = 0;
+    mqattr.mq_maxmsg = 10;
+    mqattr.mq_msgsize = sizeof(gpio_msg);
+    mq_unlink("/from_qemu_bcm2835_gpio");
+    mq_unlink("/to_qemu_bcm2835_gpio");
+    s->mq_send = mq_open("/from_qemu_bcm2835_gpio", O_CREAT | O_WRONLY, S_IRUSR | S_IWUSR, &mqattr);
+    if(s->mq_send == -1) {
+        perror("Failed to create message queue from_qemu_bcm2835_gpio");
+        exit(1);
+    }
+    s->mq_recv = mq_open("/to_qemu_bcm2835_gpio", O_CREAT | O_RDONLY, S_IRUSR | S_IWUSR, &mqattr);
+    if (s->mq_recv == -1)
+    {
+        perror("Failed to create message queue to_qemu_bcm2835_gpio");
+        exit(1);
+    }
+    mqattr.mq_flags = O_NONBLOCK;
+    if (-1 == mq_setattr(s->mq_send, &mqattr, NULL))
+    {
+        perror("Failed to set attributes on message queue from_qemu_bcm2835_gpio");
+        exit(1);
+    }
+    qemu_thread_create(&s->thread, "bcm2835_gpio", bcm2835_gpio_thread, s, QEMU_THREAD_JOINABLE);
 }
 
 static void bcm2835_gpio_realize(DeviceState *dev, Error **errp)
@@ -433,12 +577,29 @@ static void bcm2835_gpio_class_init(ObjectClass *klass, void *data)
     dc->reset = &bcm2835_gpio_reset;
 }
 
+static void bcm2835_gpio_finalize(Object *obj)
+{
+    BCM2835GpioState *s = BCM2835_GPIO(obj);
+
+    gpio_msg msg;
+    msg.magic = GPIO_MSG_MAGIC;
+    msg.pin = 127;
+    msg.state = 0;
+    mq_send(s->mq_send, (const char *)&msg, sizeof(msg), 0);
+
+    mq_close(s->mq_send);
+    mq_close(s->mq_recv);
+    mq_unlink("/from_qemu_bcm2835_gpio");
+    mq_unlink("/to_qemu_bcm2835_gpio");
+}
+
 static const TypeInfo bcm2835_gpio_info = {
     .name          = TYPE_BCM2835_GPIO,
     .parent        = TYPE_SYS_BUS_DEVICE,
     .instance_size = sizeof(BCM2835GpioState),
     .instance_init = bcm2835_gpio_init,
     .class_init    = bcm2835_gpio_class_init,
+    .instance_finalize = bcm2835_gpio_finalize,
 };
 
 static void bcm2835_gpio_register_types(void)

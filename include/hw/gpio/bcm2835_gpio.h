@@ -24,6 +24,7 @@
 #include "hw/sysbus.h"
 #include "qom/object.h"
 #include "hw/intc/bcm2835_ic.h"
+#include "mqueue.h"
 
 struct BCM2835GpioState {
     SysBusDevice parent_obj;
@@ -48,6 +49,10 @@ struct BCM2835GpioState {
     uint8_t sd_fsel;
     qemu_irq out[54];
     qemu_irq irq[3];
+
+    QemuThread thread;
+    QemuMutex data_lock;
+    mqd_t mq_send, mq_recv;
 };
 
 #define TYPE_BCM2835_GPIO "bcm2835_gpio"

@@ -1,0 +1,6 @@
+{
+    "files.associations": {
+        "bcm2835_gpio.h": "c",
+        "sysbus.h": "c"
+    }
+}
