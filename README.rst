@@ -1,3 +1,6 @@
+Modify: bcm_2835_gpio will send and receive gpio information with message queue "/from_qemu_bcm2835_gpio" and "/to_qemu_bcm2835_gpio".
+See bcm2835_gpio.c and qemu_gpio_client.py
+
 ===========
 QEMU README
 ===========
